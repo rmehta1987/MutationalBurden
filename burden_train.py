@@ -155,12 +155,12 @@ def run_model(dataset_path: str, device='cpu') -> None:
 
 def create_simualated_data():
 
-    true_weights = torch.tensor(np.array([-4, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1.2, 0, 37.1, 0, 0, 50, - 0.00005, 10, 3, 0]))
+    true_weights = torch.tensor(np.array([-4, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1.2, 0, 37.1, 0, 0, 50, - 0.00005, 10, 3, 0])).float()
     true_se = torch.tensor(np.array([-1.53656726, -1.12270527,  1.33041824, -0.8407924 ,  0.12089116,
        -1.02052477,  0.63523762, -1.2773014 , -0.14838007,  0.55948691,
         0.0581737 ,  1.14084851, -1.3167906 , -0.80398104,  1.61177848,
        -0.89317884, -0.54195322,  0.99309246, -1.15119029, -0.39033024])).pow(2)
-    estimated_weights_sampler = torch.distributions.normal.Normal(true_weights, true_se)
+    estimated_weights_sampler = torch.distributions.multivariate_normal.MultivariateNormal(true_weights, torch.eye(true_weights.shape[0]))
     estimated_weights = estimated_weights_sampler.sample((10000,))
 
     return true_weights, estimated_weights, true_se
@@ -352,7 +352,7 @@ def run_model_test_iwae():
 
     # Set up model
     model = VariationalBurden(num_variants=num_zero_pad, hidden_sz=2*num_zero_pad, latent_sz=num_zero_pad, batch_size=50, lambda_param=0.1, num_transforms=2, num_blocks=2, 
-                              dropout_probability=0.0, permute_flow=True, use_batch_norm=False,num_bins=8,tail_bound=4, device=False)
+                              dropout_probability=0.0, permute_flow=False, use_batch_norm=False,num_bins=8,tail_bound=4, device=False)
     dict_of_params = model.model_parameters()
     #selector_opt = torch.optim.Adam(dict_of_params['selector'], lr=1e-3, weight_decay=1e-2)
     prior_opt = torch.optim.Adam(dict_of_params['prior'], lr=1e-3, weight_decay=1e-2)
@@ -370,8 +370,9 @@ def run_model_test_iwae():
     kl_spike_losses = []
     recon_losses = []
     num_samples = 5
+    model.train()
     while epoch <= max_num_epochs:
-        model.train()
+        
         for i, (beta, mask) in enumerate(zip(estimated_dataset, mask_dataset)):
 
             beta_batch, beta_col = beta.shape
@@ -395,11 +396,12 @@ def run_model_test_iwae():
             #latent_loss, beta_hat_loss, kl_slab, kl_spike, posterior_beta, true_beta, mean_estimate, spikes, prior_dist = model.latent_variable_update_with_flow_and_decoder(beta, mask, standard_error, posterior_beta, 
             #                                                                                                                  selector_logits, selected, critic_mean, critic_var)
             
-            # latent_loss, beta_hat_loss, kl_slab, kl_spike, \
+            #latent_loss, beta_hat_loss, kl_slab, kl_spike, \
             #     posterior_beta, true_beta, mean_estimate, \
             #         spikes, prior_dist = model.iwae_latent_variable_update_with_flow_and_decoder(beta, mask, standard_error, 
             #                                                                                      posterior_beta, posterior_dist, selector_logits, 
-            #                                                                                      selected, critic_mean, critic_var)
+            #                                                                                      selected, critic_mean, critic_var, num_samples, beta_batch)
+            
             
             latent_loss, beta_hat_loss, kl_slab, kl_spike, \
                  posterior_beta, true_beta, mean_estimate, \
@@ -415,10 +417,10 @@ def run_model_test_iwae():
 
             latent_loss.backward()
 
-            #torch.nn.utils.clip_grad_norm_(dict_of_params['prior'], 1., norm_type=2)
+            torch.nn.utils.clip_grad_norm_(dict_of_params['prior'], 1., norm_type=2)
             
             #torch.nn.utils.clip_grad_norm_(dict_of_params['selector'], 1., norm_type=2)
-            #prior_opt.step()
+            prior_opt.step()
             encoder_opt.step()
             #selector_opt.step()
             
@@ -439,8 +441,8 @@ def run_model_test_iwae():
                 print("Number of expected variants is 9, number predicted on average is {}".format(exp_spikes[:35]))
                 #print("Average value of true_beta predicted: {}".format(posterior_beta.mean(axis=0)[:25]))
                 #print("Average value of recon_beta predicted: {}".format(mean_estimate.mean(axis=0)[:25]))
-                #prior_samps = prior_dist.rsample()
-                #print("Average value of prior: {}".format(prior_samps[:10].detach()))
+                prior_samps = prior_dist.sample((1000,)).mean(axis=0)
+                print("Average value of prior: {}".format(prior_samps[:20].detach()))
                 #print("Number of expected variants is 9, number predicted on average is {}".format(torch.round(spikes.detach())[0,:10]))
 
                 print('\n')

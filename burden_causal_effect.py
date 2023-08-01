@@ -111,6 +111,30 @@ class BurdenCritic(nn.Module):
 
         return q
 
+class BurdenActor(nn.Module):
+    def __init__(self, input_sz, hidden_szs, latent_sz, num_layers):
+        super(BurdenActor, self).__init__()
+
+        self.input_sz = input_sz # Max number of snps 
+        self.hidden_szs = hidden_szs 
+        self.n_layer = num_layers
+        self.latent_sz = latent_sz
+        self.encoder = nn.Sequential()
+
+        # setup the three linear transformations used
+        for _ in range(self.n_layer - 2):
+            self.encoder.append(nn.Linear(self.input_sz, self.hidden_szs))
+            self.encoder.append(nn.ReLU())
+        
+        self.encoder.append(nn.Linear(self.hidden_szs,self.latent_sz))
+
+    def forward(self, state):
+
+        a = self.encoder(state)
+        a = torch.tanh(a) # create logits
+
+        return a
+
 
 class VariationalBurden(nn.Module):
     def __init__(self, num_variants: int=10, hidden_sz: int=5, latent_sz: int=1, batch_size: int=25, lambda_param: float=0.1,
@@ -134,18 +158,10 @@ class VariationalBurden(nn.Module):
         self.alpha= 1/num_variants # 
         self.temperature = torch.tensor(.2)
         self.batch_size = batch_size
-
-        # The neural network
-        #         
-        # Build priors
-        #self.critic_prior = self.burden_critic_nsf()
-        #self.baseline_prior = self.burden_critic_nsf()
+        self.reinforcement_learning = True
 
         # Build pyro based priors
         self.latent_prior, self.latent_net = self.burden_critic_baseline_nsf_pyro()
-        #self.latent_prior, self.latent_net = self.burden_critic_baseline_affine_diag_pyro()
-        #self.latent_prior, self.latent_net = self.burden_critic_baseline_affine_coupling_pyro()
-        #self.baseline_prior, self.baseline_net = self.burden_critic_baseline_nsf_pyro()
 
         # Build Encoder
         self.encoder = BurdenEncoder(self.input_sz, self.hidden_sz, self.latent_sz, num_layers=1)
@@ -156,7 +172,7 @@ class VariationalBurden(nn.Module):
         # Build Critic
         self.critic_net = BurdenCritic(self.input_sz, self.hidden_sz, num_layers=3)
 
-        #Build selector network
+        #Build Selector network/Actor Network
         self.selector_network = self.burden_actor()
 
     
@@ -299,9 +315,6 @@ class VariationalBurden(nn.Module):
         Returns:
             _type_: _description_
         """        
-
-        
-        
         #This +KL(Q(z|x)||p(z)) -- note the positive 
         #kl_part_1 = 0.5 * torch.sum(torch.mul(spike,true_beta_mean.pow(2) + true_beta_var.exp() - 1 - true_beta_var), axis=1, keepdim=True)
         kl_part_1 = -0.5*true_beta_var - 0.5
@@ -565,7 +578,8 @@ class VariationalBurden(nn.Module):
 
         return total_loss, beta_hat_loss.detach(), kl_slab_loss.detach(), 10*spike_kl.detach(), posterior_beta.detach(), true_beta.detach(), recon.detach(), q_z_x_samples, self.latent_prior
     
-    def iwae_latent_variable_update_with_flow_and_decoder(self, x, mask, standard_error, posterior_beta, posterior_dist, logit_spike, selected, true_beta_mean, true_beta_var):
+    def iwae_latent_variable_update_with_flow_and_decoder(self, x, mask, standard_error, posterior_beta, posterior_dist, logit_spike, selected, 
+                                                           true_beta_mean, true_beta_var, num_samples, batch_size):
         """Importance weighted elbo
 
         Args:
@@ -578,7 +592,8 @@ class VariationalBurden(nn.Module):
         Returns:
             _type_: _description_
         """
-        spike = torch.clamp(logit_spike.exp(),1e-6,1-1e-6)
+        spike = torch.mul(logit_spike.exp(), mask) + 1e-6
+        spike = torch.clamp(spike, 1e-6, 1.0-1e-6)
         #IW-ELBO is:
         #E[LOG[P(X|z)] - LOG[KL(Q||P)]] Note that the log is inside the expectation
 
@@ -587,15 +602,14 @@ class VariationalBurden(nn.Module):
         
         # Find p(z)
         p_z_log_prob, p_z_det = self.log_prob(posterior_beta)
-        p_z_total_log_prob = p_z_log_prob + torch.diagonal_scatter(torch.zeros_like(p_z_log_prob),p_z_det,dim1=1,dim2=2)
+        p_z_total_log_prob = p_z_log_prob + torch.diagonal_scatter(torch.zeros_like(p_z_log_prob),p_z_det)
 
         # Find p(z) - q(z|x)
 
         iw_qz_pz = p_z_total_log_prob - log_Q_e_Fx
 
-        # Find pi[p(z) - q(z|x)]
-        #slab_loss = torch.sum(torch.mul(logit_spike, iw_qz_pz),axis=1, keepdim=True)
-        slab_loss = torch.sum(torch.mul(spike, iw_qz_pz),axis=1, keepdim=True)
+        # Find pi*[p(z) - q(z|x)]
+        slab_loss = torch.sum(torch.mul(spike, iw_qz_pz),axis=-1, keepdim=True)
 
         # find q(pi | x)
         #q_sampler = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(temperature=self.temperature, logits=logit_spike)
@@ -604,11 +618,8 @@ class VariationalBurden(nn.Module):
         log_Q_e_Fpi = q_sampler.log_prob(pi_samples)
 
         # find p(pi)
-        mask_prior = torch.sum(mask,axis=1,keepdim=True)*mask
-        mask_prior[:,0] += 1
-        mask_prior = torch.nan_to_num(torch.pow(mask_prior, torch.tensor(-1)),nan=0.0,posinf=0.0,neginf=0.0) # create uniform probs except where 0
-        #mask_prior = torch.where(mask_prior==0,0.5,mask_prior)
-        #mask_prior = torch.log(1/(1-mask_prior)) # convert to logits
+        mask_prior = torch.sum(mask,axis=-1,keepdim=True)*mask
+        mask_prior = torch.nan_to_num(torch.pow(mask_prior, torch.tensor(-1)),nan=1.0,posinf=0.0,neginf=0.0) # create uniform probs except where 0
         prior_probs = torch.ones_like(logit_spike)*mask_prior
         p_sampler = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(temperature=self.temperature, probs=prior_probs)
         log_P_d_Fpi = p_sampler.log_prob(pi_samples)
@@ -616,23 +627,31 @@ class VariationalBurden(nn.Module):
         # find p(pi) - q(pi|x)
 
         iw_qpi_ppi = log_P_d_Fpi - log_Q_e_Fpi
-        spike_loss = torch.sum(iw_qpi_ppi, axis=1, keepdim=True)
+        spike_loss = torch.sum(iw_qpi_ppi, axis=-1, keepdim=True)
 
         # Find p(x|z)
         posterior_beta = torch.mul(pi_samples,posterior_beta)
-        mean_estimate = self.decoder(posterior_beta)
-        #mean_estimate = torch.mul(mean_estimate,mask)
-        loss_fn = nn.GaussianNLLLoss(reduction='none') 
-        beta_hat_loss = torch.sum(loss_fn(mean_estimate, x, standard_error),axis=1, keepdim=True)
+        mean_estimate, log_var_estimate = self.decoder(posterior_beta)
+        mean_estimate = torch.mul(mean_estimate, mask)
+        log_var_estimate = torch.mul(log_var_estimate, mask)
+        beta_hat_sampler = torch.distributions.Normal(loc=mean_estimate, scale=log_var_estimate.mul(0.5).exp_()).log_prob(x)
+        beta_hat_loss = torch.sum(beta_hat_sampler, axis=-1,keepdim=True)
         
         with torch.no_grad():
             eps = torch.randn_like(true_beta_var)
             true_beta =  true_beta_mean+eps*torch.exp(0.5*true_beta_var)
-            beta_hat_sampler =  torch.distributions.normal.Normal(mean_estimate,torch.sqrt(standard_error+1e-6))
-            recon = beta_hat_sampler.sample()
+            beta_hat_sampler_2 =  torch.distributions.Normal(loc=mean_estimate, scale=log_var_estimate.mul(0.5).exp_())
+            recon = beta_hat_sampler_2.sample()
 
-        weights = beta_hat_loss + slab_loss + spike_loss
-        total_loss = -torch.mean(torch.logsumexp(weights,0))
+        log_weights = (beta_hat_loss + slab_loss + spike_loss).squeeze(-1)
+        log_weights =  log_weights.reshape(batch_size, num_samples) # Shape of [batch_size, K]
+        with torch.no_grad():
+            log_w_tilde = log_weights - torch.logsumexp(log_weights,dim=-1,keepdim=True) # normalize weights over K-samples
+            w_tilde = log_w_tilde.exp()
+            posterior_beta.register_hook(lambda grad: w_tilde.reshape(batch_size*num_samples).unsqueeze(-1) * grad.reshape(batch_size*num_samples,-1))
+        sum_over_iwae_samples = torch.sum(w_tilde*log_weights,axis=-1) # Sum over K-samples
+        total_loss = -torch.mean(sum_over_iwae_samples)
+
 
         return total_loss, beta_hat_loss.detach(), slab_loss.detach(), spike_loss.detach(), posterior_beta.detach(), true_beta.detach(), recon.detach(), pi_samples, self.latent_prior
 
@@ -716,7 +735,10 @@ class VariationalBurden(nn.Module):
         """ 
             Build actor, find selected features.
         """
-        return BurdenSelector(self.input_sz, self.hidden_sz, self.latent_sz, 0, num_layers=2)
+        if self.reinforcement_learning:
+            return BurdenActor(self.input_sz, self.hidden_sz, self.latent_sz, num_layers=2)
+        else:
+            return BurdenSelector(self.input_sz, self.hidden_sz, self.latent_sz, 0, num_layers=2)
     
     def burden_critic_baseline_nsf_pyro(self, base=None):
         dim = self.input_sz
@@ -831,49 +853,42 @@ class VariationalBurden(nn.Module):
         Args:
             betas (torch.floattensor): _description_
         """
-        # if using Pyro
-        #betas, _ = data
-        #critic_true_beta = self.critic_prior.rsample([betas.shape[0],])
+        if self.reinforcement_learning:
+            betas, mask = data
 
-        #baseline_true_beta = self.baseline_prior.rsample([betas.shape[0],])
+        else:
+            betas, mask = data
+                    
+            _, critic_mean, log_critic_var, selectors = self.encoder(betas)
+            #_, critic_mean, log_critic_var = self.encoder(betas)
+            posterior_beta, posterior_dist = self.reparameterize(critic_mean, log_critic_var.exp())
+            
 
-        # if using nflows
-        #critic_true_beta = self.critic_prior.rsample(betas.shape[0])
-        #baseline_true_beta = self.baseline_prior.rsample(betas.shape[0])
+            # Calculate q(B|estimated beta, se)
+            
+            #selectors =  self.selector_network([posterior_beta.detach(), mask]) # q(pi | true_beta)
+            #selectors =  self.selector_network([betas, mask]) # q(pi | estimated_beta)
+            #selectors = torch.nn.functional.relu(selectors)*-1.0 # logscale probabilities, log(pi)
 
-        #betas, selectors, mask = data
-        betas, mask = data
-                
-        _, critic_mean, log_critic_var, selectors = self.encoder(betas)
-        #_, critic_mean, log_critic_var = self.encoder(betas)
-        posterior_beta, posterior_dist = self.reparameterize(critic_mean, log_critic_var.exp())
-        
+            # doing this for logits
+            
+            #selectors = torch.nn.functional.sigmoid(selectors) # logits 
+            #selectors = torch.mul(selectors,mask)
+            #selectors = torch.where(selectors==0,0.5,selectors) # so that masked locations have logits of 0.5 which correspond to probability of 0.5
+    
+            # Calculate selected variants/features q(pi | X)
+            selectors = torch.nn.functional.relu(selectors)*-1.0 # logscale probabilities, log(pi) 
 
-        # Calculate q(B|estimated beta, se)
-        
-        #selectors =  self.selector_network([posterior_beta.detach(), mask]) # q(pi | true_beta)
-        #selectors =  self.selector_network([betas, mask]) # q(pi | estimated_beta)
-        #selectors = torch.nn.functional.relu(selectors)*-1.0 # logscale probabilities, log(pi)
+            #posterior_beta = torch.mul(selected.exp(), posterior_beta)
+            if torch.any(torch.isnan(posterior_beta)):
+                print("WTF posterior beta in forward")
 
-        # doing this for logits
-        
-        #selectors = torch.nn.functional.sigmoid(selectors) # logits 
-        #selectors = torch.mul(selectors,mask)
-        #selectors = torch.where(selectors==0,0.5,selectors) # so that masked locations have logits of 0.5 which correspond to probability of 0.5
- 
-        # Calculate selected variants/features q(pi | X)
-        selectors = torch.nn.functional.relu(selectors)*-1.0 # logscale probabilities, log(pi) 
+            # Calculate actor state
+            #selectors = self.selector_network([betas, mask])
 
-        #posterior_beta = torch.mul(selected.exp(), posterior_beta)
-        if torch.any(torch.isnan(posterior_beta)):
-            print("WTF posterior beta in forward")
-
-        # Calculate actor state
-        #selectors = self.selector_network([betas, mask])
-
-        #return (selectors, critic_true_beta, 0)
-        #return (selectors, posterior_beta, critic_mean, log_critic_var)
-        return (posterior_beta, posterior_dist, critic_mean, log_critic_var, selectors, 0)
+            #return (selectors, critic_true_beta, 0)
+            #return (selectors, posterior_beta, critic_mean, log_critic_var)
+            return (posterior_beta, posterior_dist, critic_mean, log_critic_var, selectors, 0)
 
     def reparameterize(self, mu, logvar):
         """Reparameterizes mean and standard from a neural network, this is too allow gradients to backpropogate
