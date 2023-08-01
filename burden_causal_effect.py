@@ -43,25 +43,25 @@ class BurdenEncoder(nn.Module):
         # setup the three linear transformations used
         for _ in range(self.n_layer - 2):
             self.encoder.append(nn.Linear(self.hidden_szs, self.hidden_szs))
-            self.encoder.append(nn.ReLU())
+            self.encoder.append(nn.SiLU())
         
         self.mean_linear = nn.Linear(self.hidden_szs, self.latent_sz)
         self.log_var_linear = nn.Linear(self.hidden_szs, self.latent_sz)
-        self.logspike = nn.Linear(self.hidden_szs, self.latent_sz)
+        self.spike_linear = nn.Linear(self.hidden_szs, self.latent_sz)
 
 
     def forward(self, x):
 
         z = self.encoder(x)
         mean = self.mean_linear(z)
-        log_var = self.log_var_linear(z)
-        logspike = self.logspike(z)
-        #log_var = -6 + torch.nn.functional.softplus(log_var - 6) # clip
+        log_var = torch.log(torch.nn.functional.softplus(self.log_var_linear(z)))
+        spike = torch.nn.functional.sigmoid(self.spike_linear(z)) # create probabilities
         if torch.any(torch.isnan(log_var)): 
             print("WTF")
         if torch.any(torch.isnan(mean)): 
             print("WTF")
-        return z, mean, log_var, logspike
+        return z, mean, log_var, spike
+        #return z, mean, log_var
 
 class BurdenDecoder(nn.Module):
     def __init__(self, input_sz, hidden_szs, latent_sz, num_layers):
@@ -76,15 +76,18 @@ class BurdenDecoder(nn.Module):
         self.decoder.append(nn.Linear(self.latent_sz, self.hidden_szs))
         for _ in range(self.n_layer - 2):
             self.decoder.append(nn.Linear(self.hidden_szs, self.hidden_szs))
-            self.decoder.append(nn.ReLU())
+            self.decoder.append(nn.SiLU())
         
         self.mean_linear = nn.Linear(self.hidden_szs, self.input_sz)
+        self.log_var_linear = nn.Linear(self.hidden_szs, self.input_sz)
+
 
     def forward(self, x):
         
         x_hat = self.decoder(x)
         mean = self.mean_linear(x_hat)
-        return mean
+        log_var = torch.log(torch.nn.functional.softplus(self.log_var_linear(x_hat)))
+        return mean, log_var
     
 
 class BurdenCritic(nn.Module):
@@ -129,7 +132,7 @@ class VariationalBurden(nn.Module):
         self.lamda_hyper_param = lambda_param
         self.device = device
         self.alpha= 1/num_variants # 
-        self.temperature = torch.tensor(.1)
+        self.temperature = torch.tensor(.2)
         self.batch_size = batch_size
 
         # The neural network
@@ -145,10 +148,10 @@ class VariationalBurden(nn.Module):
         #self.baseline_prior, self.baseline_net = self.burden_critic_baseline_nsf_pyro()
 
         # Build Encoder
-        self.encoder = BurdenEncoder(self.input_sz, self.hidden_sz, self.latent_sz, num_layers=3)
+        self.encoder = BurdenEncoder(self.input_sz, self.hidden_sz, self.latent_sz, num_layers=1)
         
         # Build decoder
-        self.decoder = BurdenDecoder(self.input_sz, self.hidden_sz, self.latent_sz, num_layers=3)
+        self.decoder = BurdenDecoder(self.input_sz, self.hidden_sz, self.latent_sz, num_layers=1)
 
         # Build Critic
         self.critic_net = BurdenCritic(self.input_sz, self.hidden_sz, num_layers=3)
@@ -356,6 +359,85 @@ class VariationalBurden(nn.Module):
 
         return total_loss, beta_hat_loss.detach(), kl_slab_loss.detach(), spike_kl.detach(), posterior_beta.detach(), true_beta.detach(), recon.detach()
     
+    def iwae_latent_variable_update_with_spike_and_decoder(self, x, mask, standard_error, posterior_beta, posterior_dist, logit_spike, selected, 
+                                                           true_beta_mean, true_beta_var, num_samples, batch_size):
+        """Importance weighted elbo
+
+        Args:
+            x (_type_): _description_
+            standard_error (_type_): _description_
+            posterior_beta (_type_): _description_
+            true_beta_mean (_type_): _description_
+            true_beta_var (_type_): _description_
+
+        Returns:
+            _type_: _description_
+        """
+        spike = torch.mul(logit_spike.exp(), mask) + 1e-6
+        spike = torch.clamp(spike, 1e-6, 1.0-1e-6)
+        #IW-ELBO is:
+        #E[LOG[P(X|z)] - LOG[KL(Q||P)]] Note that the log is inside the expectation
+
+        # Find q(z|x)
+        log_Q_e_Fx = posterior_dist.log_prob(posterior_beta)
+        
+        # Find p(z) -- Gaussian unit variance
+        mu_prior = torch.zeros_like(posterior_beta)
+        std_prior = torch.ones_like(posterior_beta)
+        p_z = torch.distributions.Normal(loc=mu_prior, scale=std_prior)
+        p_z_log_prob = p_z.log_prob(posterior_beta)
+
+        # Find p(z) - q(z|x)
+
+        iw_qz_pz = p_z_log_prob - log_Q_e_Fx
+
+        # Find pi*[p(z) - q(z|x)]
+        slab_loss = torch.sum(torch.mul(spike, iw_qz_pz),axis=-1, keepdim=True)
+
+        # find q(pi | x)
+        #q_sampler = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(temperature=self.temperature, logits=logit_spike)
+        q_sampler = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(temperature=self.temperature, probs=spike)
+        pi_samples = q_sampler.rsample()
+        log_Q_e_Fpi = q_sampler.log_prob(pi_samples)
+
+        # find p(pi)
+        mask_prior = torch.sum(mask,axis=-1,keepdim=True)*mask
+        mask_prior = torch.nan_to_num(torch.pow(mask_prior, torch.tensor(-1)),nan=1.0,posinf=0.0,neginf=0.0) # create uniform probs except where 0
+        prior_probs = torch.ones_like(logit_spike)*mask_prior
+        p_sampler = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(temperature=self.temperature, probs=prior_probs)
+        log_P_d_Fpi = p_sampler.log_prob(pi_samples)
+
+        # find p(pi) - q(pi|x)
+
+        iw_qpi_ppi = log_P_d_Fpi - log_Q_e_Fpi
+        spike_loss = torch.sum(iw_qpi_ppi, axis=-1, keepdim=True)
+
+        # Find p(x|z)
+        posterior_beta = torch.mul(pi_samples,posterior_beta)
+        mean_estimate, log_var_estimate = self.decoder(posterior_beta)
+        mean_estimate = torch.mul(mean_estimate, mask)
+        log_var_estimate = torch.mul(log_var_estimate, mask)
+        beta_hat_sampler = torch.distributions.Normal(loc=mean_estimate, scale=log_var_estimate.mul(0.5).exp_()).log_prob(x)
+        beta_hat_loss = torch.sum(beta_hat_sampler, axis=-1,keepdim=True)
+        
+        with torch.no_grad():
+            eps = torch.randn_like(true_beta_var)
+            true_beta =  true_beta_mean+eps*torch.exp(0.5*true_beta_var)
+            beta_hat_sampler_2 =  torch.distributions.Normal(loc=mean_estimate, scale=log_var_estimate.mul(0.5).exp_())
+            recon = beta_hat_sampler_2.sample()
+
+        log_weights = (beta_hat_loss + slab_loss + spike_loss).squeeze(-1)
+        log_weights =  log_weights.reshape(batch_size, num_samples) # Shape of [batch_size, K]
+        with torch.no_grad():
+            log_w_tilde = log_weights - torch.logsumexp(log_weights,dim=-1,keepdim=True) # normalize weights over K-samples
+            w_tilde = log_w_tilde.exp()
+            posterior_beta.register_hook(lambda grad: w_tilde.reshape(batch_size*num_samples).unsqueeze(-1) * grad.reshape(batch_size*num_samples,-1))
+        sum_over_iwae_samples = torch.sum(w_tilde*log_weights,axis=-1) # Sum over K-samples
+        total_loss = -torch.mean(sum_over_iwae_samples)
+
+        return total_loss, beta_hat_loss.detach(), slab_loss.detach(), spike_loss.detach(), posterior_beta.detach(), true_beta.detach(), recon.detach(), pi_samples, 0
+
+    
     
     def latent_variable_update_with_flow(self, x, standard_error, posterior_beta, true_beta_mean, true_beta_var):
 
@@ -425,7 +507,7 @@ class VariationalBurden(nn.Module):
         """
         
         #ELBO is:
-        #E[P(X|z)] - KL(Q||P)
+        #E[P(X|z)] - E[KL(Q||P)]
         # Since we are using a flow prior
         # KL(Q||P) = -1*(E[f^-1(P(z))] + H(Q)) where H is entropy
         # E[P(X|z)] + (E[f^-1(P(z))] + H(Q))
@@ -435,7 +517,8 @@ class VariationalBurden(nn.Module):
         # Calculate log_prob of seeing posterior under prior # EQφ(z|x)[log Pψ(z)] ≈ sum [ log Pψ(µ + eps*σ) ]
         spike = torch.mul(logspike.exp(), mask)
         spike = torch.clamp(spike, 1e-6, 1.0-1e-6)
-        entropy = 0.5*self.gaussian_entropy(true_beta_var)
+   
+        entropy = self.gaussian_entropy(true_beta_var)
         
         if torch.any(torch.isnan(posterior_beta)):
             print("WTF is posterior beta in flow and decoder")
@@ -454,10 +537,10 @@ class VariationalBurden(nn.Module):
         spike_kl = torch.sum(spike_kl_part_1+spike_kl_part_2,axis=1, keepdim=True)
 
         # Selector net/sampler
-        #q_sampler = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(temperature=self.temperature, probs=spike)
+        q_sampler = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(temperature=self.temperature, logits=logspike)
         # Calculated which columns are selected
-        q_sampler = RelaxedBernoulliStraightThrough(temperature=self.temperature, probs=spike)        
-        q_z_x_samples = torch.mul(q_sampler.rsample(),mask)
+        #q_sampler = RelaxedBernoulliStraightThrough(temperature=self.temperature, probs=spike)        
+        q_z_x_samples = torch.clamp(torch.mul(q_sampler.rsample(),mask),1e-6,1)
         # calculate reconstruction error
         posterior_beta = torch.mul(q_z_x_samples,posterior_beta)
         mean_estimate = self.decoder(posterior_beta)
@@ -477,10 +560,82 @@ class VariationalBurden(nn.Module):
         # need to minimize so -ELBO
         # total loss = -ELBO = Negative_log_likli - (E[f^-1(z)] + H) + KL_SPIKE
 
-        total_loss = torch.mean(beta_hat_loss - 0.5*kl_slab_loss + spike_kl,axis=0 )
+        total_loss = torch.mean(beta_hat_loss - kl_slab_loss + 10*spike_kl,axis=0 )
         #total_loss = torch.mean(-kl_slab_loss,axis=0 )
 
-        return total_loss, beta_hat_loss.detach(), kl_slab_loss.detach(), spike_kl.detach(), posterior_beta.detach(), true_beta.detach(), recon.detach(), q_z_x_samples
+        return total_loss, beta_hat_loss.detach(), kl_slab_loss.detach(), 10*spike_kl.detach(), posterior_beta.detach(), true_beta.detach(), recon.detach(), q_z_x_samples, self.latent_prior
+    
+    def iwae_latent_variable_update_with_flow_and_decoder(self, x, mask, standard_error, posterior_beta, posterior_dist, logit_spike, selected, true_beta_mean, true_beta_var):
+        """Importance weighted elbo
+
+        Args:
+            x (_type_): _description_
+            standard_error (_type_): _description_
+            posterior_beta (_type_): _description_
+            true_beta_mean (_type_): _description_
+            true_beta_var (_type_): _description_
+
+        Returns:
+            _type_: _description_
+        """
+        spike = torch.clamp(logit_spike.exp(),1e-6,1-1e-6)
+        #IW-ELBO is:
+        #E[LOG[P(X|z)] - LOG[KL(Q||P)]] Note that the log is inside the expectation
+
+        # Find q(z|x)
+        log_Q_e_Fx = posterior_dist.log_prob(posterior_beta)
+        
+        # Find p(z)
+        p_z_log_prob, p_z_det = self.log_prob(posterior_beta)
+        p_z_total_log_prob = p_z_log_prob + torch.diagonal_scatter(torch.zeros_like(p_z_log_prob),p_z_det,dim1=1,dim2=2)
+
+        # Find p(z) - q(z|x)
+
+        iw_qz_pz = p_z_total_log_prob - log_Q_e_Fx
+
+        # Find pi[p(z) - q(z|x)]
+        #slab_loss = torch.sum(torch.mul(logit_spike, iw_qz_pz),axis=1, keepdim=True)
+        slab_loss = torch.sum(torch.mul(spike, iw_qz_pz),axis=1, keepdim=True)
+
+        # find q(pi | x)
+        #q_sampler = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(temperature=self.temperature, logits=logit_spike)
+        q_sampler = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(temperature=self.temperature, probs=spike)
+        pi_samples = q_sampler.rsample()
+        log_Q_e_Fpi = q_sampler.log_prob(pi_samples)
+
+        # find p(pi)
+        mask_prior = torch.sum(mask,axis=1,keepdim=True)*mask
+        mask_prior[:,0] += 1
+        mask_prior = torch.nan_to_num(torch.pow(mask_prior, torch.tensor(-1)),nan=0.0,posinf=0.0,neginf=0.0) # create uniform probs except where 0
+        #mask_prior = torch.where(mask_prior==0,0.5,mask_prior)
+        #mask_prior = torch.log(1/(1-mask_prior)) # convert to logits
+        prior_probs = torch.ones_like(logit_spike)*mask_prior
+        p_sampler = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(temperature=self.temperature, probs=prior_probs)
+        log_P_d_Fpi = p_sampler.log_prob(pi_samples)
+
+        # find p(pi) - q(pi|x)
+
+        iw_qpi_ppi = log_P_d_Fpi - log_Q_e_Fpi
+        spike_loss = torch.sum(iw_qpi_ppi, axis=1, keepdim=True)
+
+        # Find p(x|z)
+        posterior_beta = torch.mul(pi_samples,posterior_beta)
+        mean_estimate = self.decoder(posterior_beta)
+        #mean_estimate = torch.mul(mean_estimate,mask)
+        loss_fn = nn.GaussianNLLLoss(reduction='none') 
+        beta_hat_loss = torch.sum(loss_fn(mean_estimate, x, standard_error),axis=1, keepdim=True)
+        
+        with torch.no_grad():
+            eps = torch.randn_like(true_beta_var)
+            true_beta =  true_beta_mean+eps*torch.exp(0.5*true_beta_var)
+            beta_hat_sampler =  torch.distributions.normal.Normal(mean_estimate,torch.sqrt(standard_error+1e-6))
+            recon = beta_hat_sampler.sample()
+
+        weights = beta_hat_loss + slab_loss + spike_loss
+        total_loss = -torch.mean(torch.logsumexp(weights,0))
+
+        return total_loss, beta_hat_loss.detach(), slab_loss.detach(), spike_loss.detach(), posterior_beta.detach(), true_beta.detach(), recon.detach(), pi_samples, self.latent_prior
+
 
     def baseline_loss_function(self, x, true_beta, standard_error, mask=None):
 
@@ -567,7 +722,7 @@ class VariationalBurden(nn.Module):
         dim = self.input_sz
         split_dim = self.input_sz // 2
         hidden_dims = [2*dim, 2 *dim]
-        nonlinearity = nn.ReLU()
+        nonlinearity = nn.SiLU()
         param_dims = [
             (dim - split_dim) * self.num_bins,
             (dim - split_dim) * self.num_bins,
@@ -689,19 +844,26 @@ class VariationalBurden(nn.Module):
         #betas, selectors, mask = data
         betas, mask = data
                 
-        features, critic_mean, log_critic_var, selectors = self.encoder(betas)
-        #selectors =  self.selector_network([features, mask])
-        #selectors =  self.selector_network([betas, mask])
-        selectors = torch.nn.functional.relu(selectors)*-1.0
-        #self.q_sampler = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(.01, probs=selectors)
-        #selected = self.q_sampler.rsample()
+        _, critic_mean, log_critic_var, selectors = self.encoder(betas)
+        #_, critic_mean, log_critic_var = self.encoder(betas)
+        posterior_beta, posterior_dist = self.reparameterize(critic_mean, log_critic_var.exp())
+        
 
         # Calculate q(B|estimated beta, se)
-        eps = torch.randn_like(log_critic_var)
-        posterior_beta = critic_mean+eps*torch.exp(0.5*log_critic_var)
-
-        # Calculate selected variants/features
         
+        #selectors =  self.selector_network([posterior_beta.detach(), mask]) # q(pi | true_beta)
+        #selectors =  self.selector_network([betas, mask]) # q(pi | estimated_beta)
+        #selectors = torch.nn.functional.relu(selectors)*-1.0 # logscale probabilities, log(pi)
+
+        # doing this for logits
+        
+        #selectors = torch.nn.functional.sigmoid(selectors) # logits 
+        #selectors = torch.mul(selectors,mask)
+        #selectors = torch.where(selectors==0,0.5,selectors) # so that masked locations have logits of 0.5 which correspond to probability of 0.5
+ 
+        # Calculate selected variants/features q(pi | X)
+        selectors = torch.nn.functional.relu(selectors)*-1.0 # logscale probabilities, log(pi) 
+
         #posterior_beta = torch.mul(selected.exp(), posterior_beta)
         if torch.any(torch.isnan(posterior_beta)):
             print("WTF posterior beta in forward")
@@ -711,7 +873,24 @@ class VariationalBurden(nn.Module):
 
         #return (selectors, critic_true_beta, 0)
         #return (selectors, posterior_beta, critic_mean, log_critic_var)
-        return (posterior_beta, critic_mean, log_critic_var, selectors, 0)
+        return (posterior_beta, posterior_dist, critic_mean, log_critic_var, selectors, 0)
+
+    def reparameterize(self, mu, logvar):
+        """Reparameterizes mean and standard from a neural network, this is too allow gradients to backpropogate
+
+        Args:
+            mu (_type_): _description_
+            std (_type_): _description_
+
+        Returns:
+            _type_: _description_
+        """        
+        std = logvar.mul(0.5).exp_()
+        qz_Gx_obs = torch.distributions.Normal(loc=mu, scale=std)
+        # find z|x
+        z_Gx = qz_Gx_obs.rsample() # make sure to use rsample for reparameterizeable
+        return z_Gx, qz_Gx_obs
+
 
     def model_parameters(self):
         # Build pyro based priors
@@ -726,10 +905,8 @@ class VariationalBurden(nn.Module):
         #model_param_list = {'critic': list(self.critic_prior.parameters()), 'baseline': list(self.baseline_prior.parameters()), 
         #                    'selector': list(self.selector_network.parameters())}
 
-        #model_param_list = {'latent': list(self.latent_net.parameters())+ list(self.encoder.parameters()), 'critic': list(self.critic_net.parameters()), 'selector': list(self.selector_network.parameters())}
-        #model_param_list = {'latent': list(self.encoder.parameters())+list(self.decoder.parameters()), 'selector': list(self.selector_network.parameters())}
-        #model_param_list = {'latent': list(self.latent_net.parameters())+ list(self.encoder.parameters())+list(self.decoder.parameters()), 'selector': list(self.selector_network.parameters())}
-        model_param_list = {'latent': list(self.latent_net.parameters())+ list(self.encoder.parameters())+list(self.decoder.parameters())}
+        #model_param_list = {'encoder': list(self.encoder.parameters())+list(self.decoder.parameters()), 'prior': list(self.latent_net.parameters()), 'selector': list(self.selector_network.parameters())}
+        model_param_list = {'encoder': list(self.encoder.parameters())+list(self.decoder.parameters()), 'prior': list(self.latent_net.parameters())}
 
         return model_param_list
 
