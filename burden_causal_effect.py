@@ -48,6 +48,7 @@ class BurdenEncoder(nn.Module):
         self.mean_linear = nn.Linear(self.hidden_szs, self.latent_sz)
         self.log_var_linear = nn.Linear(self.hidden_szs, self.latent_sz)
         self.spike_linear = nn.Linear(self.hidden_szs, self.latent_sz)
+        self.global_spike = nn.Linear(self.hidden_sz, 1) 
 
 
     def forward(self, x):
@@ -56,11 +57,12 @@ class BurdenEncoder(nn.Module):
         mean = self.mean_linear(z)
         log_var = torch.log(torch.nn.functional.softplus(self.log_var_linear(z)))
         spike = torch.nn.functional.sigmoid(self.spike_linear(z)) # create probabilities
+        g_spike = torch.nn.functional.sigmoid(self.global_spike(z))
         if torch.any(torch.isnan(log_var)): 
             print("WTF")
         if torch.any(torch.isnan(mean)): 
             print("WTF")
-        return z, mean, log_var, spike
+        return z, mean, log_var, spike, g_spike
         #return z, mean, log_var
 
 class BurdenDecoder(nn.Module):
@@ -450,7 +452,99 @@ class VariationalBurden(nn.Module):
 
         return total_loss, beta_hat_loss.detach(), slab_loss.detach(), spike_loss.detach(), posterior_beta.detach(), true_beta.detach(), recon.detach(), pi_samples, 0
 
-    
+    def iwae_latent_variable_update_with_spike_global_spike_and_decoder(self, x, mask, standard_error, posterior_beta, posterior_dist, logit_spike, g_spike, selected, 
+                                                           true_beta_mean, true_beta_var, num_samples, batch_size):
+        """Importance weighted elbo
+
+        Args:
+            x (_type_): _description_
+            standard_error (_type_): _description_
+            posterior_beta (_type_): _description_
+            true_beta_mean (_type_): _description_
+            true_beta_var (_type_): _description_
+
+        Returns:
+            _type_: _description_
+        """
+
+        global_spike = g_spike.exp() + 1e-6 # global spike probabilties
+        
+
+        spike = torch.mul(logit_spike.exp(), mask) + 1e-6
+        spike = torch.clamp(spike, 1e-6, 1.0-1e-6)
+        #IW-ELBO is:
+        #E[LOG[P(X|z)] - LOG[KL(Q||P)]] Note that the log is inside the expectation
+
+        # Find q(z|x)
+        log_Q_e_Fx = posterior_dist.log_prob(posterior_beta)
+        
+        # Find p(z) -- Gaussian unit variance
+        mu_prior = torch.zeros_like(posterior_beta)
+        std_prior = torch.ones_like(posterior_beta)
+        p_z = torch.distributions.Normal(loc=mu_prior, scale=std_prior)
+        p_z_log_prob = p_z.log_prob(posterior_beta)
+
+        # Find p(z) - q(z|x)
+
+        iw_qz_pz = p_z_log_prob - log_Q_e_Fx
+
+        # Find pi*[p(z) - q(z|x)]
+        slab_loss = torch.sum(torch.mul(spike, iw_qz_pz),axis=-1, keepdim=True)
+
+        # find q(pi | x)
+        #q_sampler = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(temperature=self.temperature, logits=logit_spike)
+        q_sampler = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(temperature=self.temperature, probs=spike)
+        pi_samples = q_sampler.rsample()
+        log_Q_e_Fpi = q_sampler.log_prob(pi_samples)
+
+        # find p(pi)
+        mask_prior = torch.sum(mask,axis=-1,keepdim=True)*mask
+        mask_prior = torch.nan_to_num(torch.pow(mask_prior, torch.tensor(-1)),nan=1.0,posinf=0.0,neginf=0.0) # create uniform probs except where 0
+        prior_probs = torch.ones_like(logit_spike)*mask_prior
+        p_sampler = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(temperature=self.temperature, probs=prior_probs)
+        log_P_d_Fpi = p_sampler.log_prob(pi_samples)
+
+        # find p(pi) - q(pi|x)
+
+        iw_qpi_ppi = log_P_d_Fpi - log_Q_e_Fpi
+        spike_loss = torch.sum(iw_qpi_ppi, axis=-1, keepdim=True)
+
+        # Find global spike 
+        q_g_sampler = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(temperature=self.temperature, probs=global_spike)
+        g_samples = q_g_sampler.rsample()
+        log_Q_e_Fg = q_g_sampler.log_prob(global_spike)
+
+        p_g_sampler = torch.distributions.relaxed_bernoulli.RelaxedBernoulli(temperature=self.temperature, probs=torch.ones_like(global_spike)*0.2)
+        log_P_dFg = p_g_sampler.log_prob(g_samples)
+
+        global_spike_loss = torch.sum(log_P_dFg - log_Q_e_Fg, axis=-1,keepdim=True)
+
+        # Find p(x|z)
+        posterior_beta = torch.mul(pi_samples,posterior_beta)
+        posterior_beta = torch.mul(g_samples, posterior_beta) # genes have no "true" effect
+        mean_estimate, log_var_estimate = self.decoder(posterior_beta)
+        mean_estimate = torch.mul(mean_estimate, mask)
+        log_var_estimate = torch.mul(log_var_estimate, mask)
+        beta_hat_sampler = torch.distributions.Normal(loc=mean_estimate, scale=log_var_estimate.mul(0.5).exp_()).log_prob(x)
+        beta_hat_loss = torch.sum(beta_hat_sampler, axis=-1,keepdim=True)
+        
+        with torch.no_grad():
+            eps = torch.randn_like(true_beta_var)
+            true_beta =  true_beta_mean+eps*torch.exp(0.5*true_beta_var)
+            beta_hat_sampler_2 =  torch.distributions.Normal(loc=mean_estimate, scale=log_var_estimate.mul(0.5).exp_())
+            recon = beta_hat_sampler_2.sample()
+
+        log_weights = (beta_hat_loss + slab_loss + spike_loss + global_spike_loss).squeeze(-1)
+
+        log_weights =  log_weights.reshape(batch_size, num_samples) # Shape of [batch_size, K]
+        with torch.no_grad():
+            log_w_tilde = log_weights - torch.logsumexp(log_weights,dim=-1,keepdim=True) # normalize weights over K-samples
+            w_tilde = log_w_tilde.exp()
+            posterior_beta.register_hook(lambda grad: w_tilde.reshape(batch_size*num_samples).unsqueeze(-1) * grad.reshape(batch_size*num_samples,-1))
+        sum_over_iwae_samples = torch.sum(w_tilde*log_weights,axis=-1) # Sum over K-samples
+        total_loss = -torch.mean(sum_over_iwae_samples)
+
+        return total_loss, beta_hat_loss.detach(), slab_loss.detach(), spike_loss.detach(), posterior_beta.detach(), true_beta.detach(), recon.detach(), pi_samples, 0, global_spike_loss.detach()
     
     def latent_variable_update_with_flow(self, x, standard_error, posterior_beta, true_beta_mean, true_beta_var):
 
