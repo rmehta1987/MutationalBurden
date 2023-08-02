@@ -36,8 +36,6 @@ class BurdenEncoder(nn.Module):
         self.latent_sz = latent_sz
         self.encoder = nn.Sequential()
 
-     
-
         # Build network
         self.encoder.append(nn.Linear(self.input_sz, self.hidden_szs))
         # setup the three linear transformations used

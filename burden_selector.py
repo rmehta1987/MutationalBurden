@@ -72,9 +72,9 @@ class BurdenSelector(nn.Module):
         self.eps = 1e-12
         for _ in range(self.n_layer - 2):
             self.selector_model.append(nn.Linear(self.hidden_szs, self.hidden_szs))
-            self.selector_model.append(nn.ReLU())
+            self.selector_model.append(nn.SiLU())
             self.selector_model.append(nn.Dropout(self.dropout_prob))
-        self.selector_model.append(nn.ReLU())
+        self.selector_model.append(nn.SiLU())
         self.selector_model.append(nn.Linear(self.hidden_szs,self.latent_sz))
         
 

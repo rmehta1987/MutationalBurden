@@ -1,7 +1,7 @@
 import hail as hl
 
 path = '30690NA_gene_effects_2'
-bhr_phenotypes = hl.import_table('Dataset/dec_bhr_ms_variant_ss_400k_final_thin_withnullburden_30690NApLoF_nvar427542_low0_high1e-05_group1_2.txt')
+bhr_phenotypes = hl.import_table('Dataset/30600NA_pLoF_nvar493097_low0_high0.01_group1.txt')
 bhr_phenotypes.describe()
 
 
