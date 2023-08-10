@@ -509,16 +509,6 @@ class VariationalBurden(nn.Module):
                                       dropout_probability=self.dropout_probability, permute_flow=self.permute, use_batch_norm=self.batch_norm,
                                       num_bins=self.num_bins, device=self.device, tail_bound=self.tail_bound)
         
-        #base_dist = torch.distributions.Independent(
-        #    torch.distributions.Uniform(
-        #        low=torch.zeros(self.latent_sz),
-        #        high=torch.ones(self.latent_sz),),
-        #        1,)
-        #self.spike_prior = buildFlow(self.input_sz, self.hidden_sz, self.latent_sz, num_transforms=self.num_transforms, num_blocks=self.num_blocks,
-        #                              dropout_probability=self.dropout_pro
-        # bability, permute_flow=self.permute, use_batch_norm=self.batch_norm,
-        #                              num_bins=self.num_bins, device=self.device, tail_bound=self.tail_bound, base=None)
-        #self.latent_prior, self.latent_net = self.burden_critic_baseline_affine_coupling_pyro()
         # Build Encoder
         self.encoder = BurdenIWEncoder(self.input_sz, self.hidden_sz, self.latent_sz, num_samples, num_layers=2)
         
